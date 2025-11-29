@@ -6,7 +6,7 @@
     },
     "cluster_overlap": {
         "pre": 0.0,
-        "post": 0.1774161458015442,
+        "post": 0.07268285751342773,
         "improvement_%": 0
     },
     "ssim": {

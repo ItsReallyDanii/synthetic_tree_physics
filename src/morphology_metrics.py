@@ -7,6 +7,7 @@ Quantifies morphological similarity between:
   - Post-hybrid model reconstructions
 
 Outputs latent distance, SSIM, and cluster overlap indices.
+Now logs history across runs for morphological convergence visualization.
 """
 
 import os
@@ -159,6 +160,23 @@ def analyze_model(model_path, label):
     plt.savefig(plot_path, dpi=200, bbox_inches="tight")
     plt.close()
     print(f"📈 Saved plot: {plot_path}")
+
+    # ---------------------------------------
+    # 🧩 Log metrics history for convergence tracking
+    # ---------------------------------------
+    history_path = os.path.join(SAVE_DIR, "history.json")
+    if not os.path.exists(history_path):
+        history = {"latent_distance": [], "cluster_overlap": [], "ssim": []}
+    else:
+        with open(history_path, "r") as f:
+            history = json.load(f)
+
+    for key in metrics:
+        history[key].append(float(metrics[key]))
+
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=4)
+    print(f"🧾 Updated history log → {history_path}")
 
     return metrics
 
