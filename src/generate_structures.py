@@ -21,7 +21,7 @@ def generate_structure(seed: int = 0, n_tubes: int = 5):
     return img
 
 if __name__ == "__main__":
-    for i in range(10):
+    for i in range(64):
         arr = generate_structure(i)
         plt.imshow(arr, cmap="gray")
         plt.axis("off")

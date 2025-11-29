@@ -1,77 +1,78 @@
-import os
 import numpy as np
-from PIL import Image
 import torch
 import torch.nn.functional as F
 
-RESULTS_DIR = "results/flow_simulation"
-os.makedirs(RESULTS_DIR, exist_ok=True)
+# ============================================================
+# Flow Simulation Utilities
+# ============================================================
 
-REAL_DIR = "data/real_xylem_preprocessed"
-SYN_DIR = "data/generated_microtubes"
-METRICS_PATH = "results/flow_metrics/flow_metrics.csv"
-os.makedirs(os.path.dirname(METRICS_PATH), exist_ok=True)
+def normalize_image(img):
+    """Normalize image to [0,1] and ensure float32 dtype."""
+    img = np.array(img, dtype=np.float32)
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    return img
 
-def load_images(path):
-    imgs = []
-    for f in sorted(os.listdir(path)):
-        if f.lower().endswith((".png", ".jpg", ".jpeg")):
-            img = np.array(Image.open(os.path.join(path, f)).convert("L")) / 255.0
-            imgs.append(img)
-    return np.array(imgs)
+
+def simulate_pressure_field(img, iterations=150):
+    """
+    Simple iterative diffusion to approximate pressure/flow field.
+    img: 2D numpy array in [0,1], where 1=solid, 0=open pore
+    """
+    h, w = img.shape
+    pressure = torch.zeros((1, 1, h, w), dtype=torch.float32)
+    mask = torch.tensor(1.0 - img, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+    for _ in range(iterations):
+        pressure = F.avg_pool2d(pressure, 3, stride=1, padding=1)
+        pressure *= mask
+
+    grad_y, grad_x = torch.gradient(pressure[0, 0])
+    grad_mag = (grad_x.abs() + grad_y.abs()).mean().item()
+    return pressure.squeeze().numpy(), grad_mag
+
 
 def compute_flow_metrics(img):
-    # Basic permeability proxy (Darcy-like)
-    porosity = np.mean(img)
-    grad_y, grad_x = np.gradient(img)
-    dp_dy = np.mean(np.abs(grad_y))
-    anisotropy = np.mean(np.abs(grad_x)) / (dp_dy + 1e-8)
-    mean_k = porosity * (1.0 - dp_dy)
-    flow_rate = mean_k * porosity
+    """
+    Compute basic flow-related metrics from a binary or grayscale pore structure.
+    Returns dict with keys: 'K', 'porosity', 'flow_grad', 'anisotropy'
+    """
+    # --- normalize input ---
+    img = normalize_image(img)
+
+    # --- physical proxies ---
+    porosity = float(np.mean(img < 0.6))  # open fraction
+
+    # simulate approximate flow field
+    pressure_field, grad_mag = simulate_pressure_field(img)
+
+    # permeability proxy (lower gradient magnitude + higher porosity → higher K)
+    K = 1.0 / (1.0 + grad_mag * (1.0 - porosity + 1e-8))
+
+    # anisotropy measure: directional gradient ratio
+    gy, gx = np.gradient(pressure_field)
+    anisotropy = np.mean(np.abs(gx)) / (np.mean(np.abs(gy)) + 1e-8)
+
     return {
-        "Mean_K": mean_k,
-        "Mean_dP/dy": dp_dy,
-        "FlowRate": flow_rate,
-        "Porosity": porosity,
-        "Anisotropy": anisotropy,
+        "K": float(K),
+        "porosity": float(porosity),
+        "flow_grad": float(grad_mag),
+        "anisotropy": float(anisotropy),
     }
 
-def simulate_batch(img_dir, label):
-    imgs = load_images(img_dir)
-    n = len(imgs)
-    if n == 0:
-        print(f"⚠️ No images found in {img_dir}")
-        return []
 
-    print(f"\n🌿 Simulating flow for {label} structures...")
-    all_metrics = []
-    efficiencies = []
+# ============================================================
+# Batch utilities for physics-informed training
+# ============================================================
 
-    for i, img in enumerate(imgs):
-        metrics = compute_flow_metrics(img)
-        all_metrics.append(metrics)
-        efficiencies.append(metrics["FlowRate"])
-
-    mean_efficiency = np.mean(efficiencies)
-    print(f"🌊 Mean relative flow efficiency ({label}): {mean_efficiency:.4f}")
-    return all_metrics, mean_efficiency
-
-def main():
-    real_metrics, real_eff = simulate_batch(REAL_DIR, "Real Xylem")
-    syn_metrics, syn_eff = simulate_batch(SYN_DIR, "Synthetic Xylem")
-
-    ratio = syn_eff / (real_eff + 1e-8)
-    print(f"\n🧩 Synthetic vs Real Flow Ratio: {ratio:.2f}")
-
-    import pandas as pd
-    df_real = pd.DataFrame(real_metrics)
-    df_real["Type"] = "Real"
-    df_syn = pd.DataFrame(syn_metrics)
-    df_syn["Type"] = "Synthetic"
-    df = pd.concat([df_real, df_syn], ignore_index=True)
-    df.to_csv(METRICS_PATH, index=False)
-
-    print(f"✅ Flow simulation complete. Results in {RESULTS_DIR}")
-
-if __name__ == "__main__":
-    main()
+def compute_batch_flow_metrics(batch):
+    """
+    Computes average K and porosity across a batch of images (PyTorch tensor).
+    Used inside physics-informed fine-tuning.
+    """
+    K_vals, P_vals = [], []
+    for img in batch:
+        img_np = img.squeeze().detach().cpu().numpy().astype(np.float32)
+        metrics = compute_flow_metrics(img_np)
+        K_vals.append(metrics["K"])
+        P_vals.append(metrics["porosity"])
+    return float(np.mean(K_vals)), float(np.mean(P_vals))

@@ -2,110 +2,127 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import transforms
-from PIL import Image
 import numpy as np
-import csv
+from PIL import Image
+
 from src.model import XylemAutoencoder
+from src.flow_simulation_utils import compute_flow_metrics, compute_batch_flow_metrics
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 MODEL_PATH = "results/model_hybrid.pth"
+SAVE_PATH = "results/model_physics_tuned.pth"
+LOG_PATH = "results/physics_training_log.csv"
+
 DATA_DIR = "data/generated_microtubes"
-SAVE_MODEL_PATH = "results/model_physics_tuned.pth"
-LOG_CSV = "results/physics_training_log.csv"
+os.makedirs("results", exist_ok=True)
 
-# strong physics influence
-LAMBDA_K = 5000.0
-LAMBDA_POROSITY = 5000.0
-num_epochs = 100
 
-TARGETS = {
-    "Mean_K": 0.52,      # real avg permeability
-    "Porosity": 0.73     # real avg porosity
-}
+# ===============================================================
+# 1. Load and normalize dataset
+# ===============================================================
+def load_generated_structures(limit=None, size=(256, 256)):
+    files = sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
+    if limit is not None:
+        files = files[:limit]
 
-# Differentiable proxy for flow physics
-def simulate_flow_metrics_torch(img):
-    img = img.squeeze(1)  # (B,H,W)
-    porosity = torch.mean((img > 0.5).float(), dim=[1,2])
-    mean_k = torch.mean(img, dim=[1,2])
-    dp_dy = torch.mean(torch.abs(torch.gradient(img, dim=1)[0]), dim=[1,2])
-    flow_rate = mean_k * porosity * 0.1
-    anisotropy = torch.std(torch.gradient(img, dim=1)[0], dim=[1,2]) / (
-        torch.std(torch.gradient(img, dim=2)[0], dim=[1,2]) + 1e-5)
-    return mean_k, porosity, flow_rate, anisotropy, dp_dy
+    imgs = []
+    for f in files:
+        img = Image.open(os.path.join(DATA_DIR, f)).convert("L").resize(size, Image.BICUBIC)
+        arr = np.array(img, dtype=np.float32)  # ✅ force float32 here
+        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
 
-def compute_physics_loss(model, imgs, criterion):
-    imgs = imgs.to(DEVICE)
-    recon, _ = model(imgs)
-    loss_recon = criterion(recon, imgs)
+        # optional normalization cleanup
+        if arr.mean() < 0.5:
+            arr = 1 - arr
+        arr = np.clip((arr - 0.5) * 2.0 + 0.5, 0, 1)
+        arr = np.where(arr > 0.6, 1.0, 0.0)
 
-    mean_k, porosity, _, _, _ = simulate_flow_metrics_torch(recon)
+        imgs.append(arr.astype(np.float32))  # ✅ make sure it's float32
 
-    # physics penalty
-    loss_phys = (
-        LAMBDA_K * torch.mean((mean_k - TARGETS["Mean_K"])**2) +
-        LAMBDA_POROSITY * torch.mean((porosity - TARGETS["Porosity"])**2)
-    )
+    imgs = np.stack(imgs, axis=0).astype(np.float32)
+    imgs = torch.tensor(imgs, dtype=torch.float32).unsqueeze(1)  # ✅ force float32 in torch
+    return imgs
 
-    total_loss = loss_recon + loss_phys
-    return total_loss, loss_recon.item(), loss_phys.item(), mean_k.mean().item(), porosity.mean().item()
 
-def train_physics_informed():
+# ===============================================================
+# 2. Physics loss (permeability + porosity)
+# ===============================================================
+def compute_physics_loss(batch):
+    K_mean, P_mean = compute_batch_flow_metrics(batch)
+    K_loss = 1.0 - K_mean
+    P_loss = (0.4 - P_mean) ** 2
+    return torch.tensor(K_loss, dtype=torch.float32), torch.tensor(P_loss, dtype=torch.float32)
+
+
+# ===============================================================
+# 3. Training loop
+# ===============================================================
+def main():
     print(f"🌱 Physics-informed fine-tuning started on {DEVICE}")
 
     model = XylemAutoencoder().to(DEVICE)
-    if os.path.exists(MODEL_PATH):
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE), strict=False)
-        print(f"✅ Loaded pretrained model from {MODEL_PATH}")
-    else:
-        print("⚠️ No pretrained model found — training from scratch.")
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model.train()
+    for p in model.parameters():
+        p.requires_grad = True
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.MSELoss()
+    print(f"✅ Loaded pretrained model from {MODEL_PATH}")
 
-    transform = transforms.Compose([
-        transforms.Grayscale(),
-        transforms.Resize((256, 256)),
-        transforms.ToTensor()
-    ])
-
-    imgs = []
-    for f in os.listdir(DATA_DIR):
-        if f.lower().endswith((".png", ".jpg", ".jpeg")):
-            img = transform(Image.open(os.path.join(DATA_DIR, f)))
-            # 🧠 Normalize pixel range per image
-            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            imgs.append(img)
-    imgs = torch.stack(imgs)
+    imgs = load_generated_structures(limit=None, size=(256, 256)).to(DEVICE)
     print(f"🧩 Loaded {len(imgs)} generated structures.")
 
-    num_epochs = 100
-    if os.path.exists(LOG_CSV):
-        os.remove(LOG_CSV)
-    with open(LOG_CSV, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "total_loss", "recon_loss", "phys_loss", "mean_k", "porosity"])
+    recon_loss_fn = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    for epoch in range(1, num_epochs + 1):
+    λ_phys = 1e-4
+    EPOCHS = 100
+    log = []
+
+    for epoch in range(1, EPOCHS + 1):
         optimizer.zero_grad()
-        total_loss, recon_loss, phys_loss, mean_k, porosity = compute_physics_loss(model, imgs, criterion)
+        recon, latent = model(imgs)
+
+        recon_loss = recon_loss_fn(recon, imgs)
+        K_loss, P_loss = compute_physics_loss(recon)
+        phys_loss = K_loss + P_loss
+        total_loss = recon_loss + λ_phys * phys_loss
+
         total_loss.backward()
         optimizer.step()
 
-        with open(LOG_CSV, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([epoch, total_loss.item(), recon_loss, phys_loss, mean_k, porosity])
+        grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.data.norm(2).item()
+        grad_norm = grad_norm / (len(list(model.parameters())) + 1e-8)
 
-        print(f"Epoch {epoch}/{num_epochs} | "
-              f"Total: {total_loss.item():.5f} | Recon: {recon_loss:.5f} | Phys: {phys_loss:.5f} | "
-              f"K: {mean_k:.5f} | Porosity: {porosity:.5f}")
+        if epoch % 5 == 0 or epoch == 1:
+            print(
+                f"Epoch {epoch}/{EPOCHS} | Total: {total_loss.item():.5f} | "
+                f"Recon: {recon_loss.item():.5f} | Phys: {phys_loss.item():.5f} | "
+                f"K: {K_loss.item():.5f} | Porosity: {P_loss.item():.5f} | GradNorm: {grad_norm:.5e}"
+            )
 
-    torch.save(model.state_dict(), SAVE_MODEL_PATH)
-    print(f"✅ Physics-informed fine-tuning complete.")
-    print(f"💾 Model saved → {SAVE_MODEL_PATH}")
-    print(f"🧾 Training log saved → {LOG_CSV}")
+        log.append({
+            "epoch": epoch,
+            "total": total_loss.item(),
+            "recon": recon_loss.item(),
+            "phys": phys_loss.item(),
+            "K": K_loss.item(),
+            "Porosity": P_loss.item(),
+            "GradNorm": grad_norm
+        })
+
+    torch.save(model.state_dict(), SAVE_PATH)
+    print(f"💾 Model saved → {SAVE_PATH}")
+
+    import csv
+    with open(LOG_PATH, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=log[0].keys())
+        writer.writeheader()
+        writer.writerows(log)
+    print(f"🧾 Training log saved → {LOG_PATH}")
+
 
 if __name__ == "__main__":
-    train_physics_informed()
+    main()

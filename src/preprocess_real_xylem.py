@@ -1,27 +1,37 @@
 import os
 from PIL import Image
-from torchvision import transforms
+import numpy as np
 
+# Correct raw and processed directories
 INPUT_DIR = "data/real_xylem_raw"
-OUTPUT_DIR = "data/real_xylem_preprocessed"
+OUTPUT_DIR = "data/real_xylem"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((256, 256))
-])
+def preprocess_image(image_path):
+    img = Image.open(image_path).convert("L")
+    arr = np.array(img, dtype=np.float32)
 
-files = sorted(os.listdir(INPUT_DIR))[:20]
-print(f"🧪 Preprocessing {len(files)} images...")
+    # Normalize 0–1
+    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
 
-for f in files:
-    in_path = os.path.join(INPUT_DIR, f)
-    out_path = os.path.join(OUTPUT_DIR, f)
-    try:
-        img = Image.open(in_path).convert("RGB")
-        img_t = transform(img)
-        img_t.save(out_path)
-    except Exception as e:
-        print(f"⚠️ Skipping {f}: {e}")
+    # Optional cleanup: binarize slightly to emphasize vessels
+    arr[arr < 0.2] = 0.0
+    arr[arr >= 0.2] = 1.0
 
-print(f"✅ Saved preprocessed images to {OUTPUT_DIR}")
+    return Image.fromarray((arr * 255).astype(np.uint8))
+
+def preprocess_all():
+    if not os.path.exists(INPUT_DIR):
+        raise FileNotFoundError(f"Input folder not found: {INPUT_DIR}")
+    
+    files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+    print(f"📂 Found {len(files)} real xylem images in {INPUT_DIR}")
+    
+    for fname in files:
+        img = preprocess_image(os.path.join(INPUT_DIR, fname))
+        img.save(os.path.join(OUTPUT_DIR, fname))
+    
+    print(f"✅ Preprocessing complete. Normalized images saved → {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    preprocess_all()
