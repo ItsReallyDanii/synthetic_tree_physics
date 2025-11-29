@@ -25,3 +25,16 @@ Natural trees maintain continuous water columns over 100 m under extreme tension
 - Measure transport stability, cavitation onset, and flow rate under negative pressure.
 
 ## Repository Structure
+synthetic_tree_physics/
+├── README.md
+├── requirements.txt
+├── data/
+│ └── generated_microtubes/
+├── src/
+│ ├── generate_structures.py
+│ ├── model.py
+│ ├── train.py
+│ ├── analyze_latent.py
+│ └── simulate_fluidics.py
+└── notebooks/
+└── exploration.ipynb
