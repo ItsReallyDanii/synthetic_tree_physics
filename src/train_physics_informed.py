@@ -93,7 +93,7 @@ def main():
         recon_loss = recon_loss_fn(recon, imgs_batch)
 
         phys_loss, K_mean, P_mean = compute_physics_loss(recon)
-        total_loss = recon_loss + 0.4 * phys_loss  # weighted combo
+        total_loss = recon_loss + 0.8 * phys_loss  # weighted combo
 
         total_loss.backward()
 
