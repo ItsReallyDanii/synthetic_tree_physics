@@ -1,5 +1,5 @@
 """
-train_physics_informed.py  (v0.2 – surrogate-based, aligned with train_surrogate)
+train_physics_informed.py  (v0.3 – physics-dominant, surrogate-based)
 
 Fine-tune the XylemAutoencoder using a learned physics surrogate.
 
@@ -13,7 +13,7 @@ Pipeline:
       recon = AE(imgs)
       pred_metrics = surrogate(recon)
       physics_loss = (mean(pred_metrics) - real_targets)^2
-      total_loss = recon_loss + λ * physics_loss
+      total_loss = RECON_WEIGHT * recon_loss + λ_phys * physics_loss
   - Save tuned AE to results/model_physics_tuned.pth
   - Save full training log to results/physics_training_log.csv
 """
@@ -32,6 +32,14 @@ from src.train_surrogate import PhysicsSurrogateCNN  # <-- single source of trut
 
 DEVICE = torch.device("cpu")
 TARGET_SIZE = (256, 256)
+
+# How much we care about pixel-wise reconstruction vs physics.
+# Physics-dominant: recon is down-weighted, physics is up-weighted.
+RECON_WEIGHT = 0.1          # was 1.0 before
+LAMBDA_PHYS_START = 3.0     # ramp start
+LAMBDA_PHYS_END = 20.0      # ramp end
+NUM_EPOCHS = 100
+
 
 # ----------------------------------------------------
 # Data loading
@@ -113,11 +121,8 @@ def main():
     optimizer = optim.Adam(ae.parameters(), lr=1e-4)
 
     logs = []
-    num_epochs = 100
-    lambda_phys_start = 1.0
-    lambda_phys_end = 10.0
 
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, NUM_EPOCHS + 1):
         optimizer.zero_grad()
 
         recon, _ = ae(imgs)
@@ -130,11 +135,12 @@ def main():
         # Physics loss: mean squared error vs real targets
         phys_loss = ((pred_mean - target_vec) ** 2).mean()
 
-        # Gradually ramp physics weight
-        t = epoch / num_epochs
-        lambda_phys = lambda_phys_start + (lambda_phys_end - lambda_phys_start) * t
+        # Gradually ramp physics weight (stronger than before)
+        t = epoch / NUM_EPOCHS
+        lambda_phys = LAMBDA_PHYS_START + (LAMBDA_PHYS_END - LAMBDA_PHYS_START) * t
 
-        total_loss = recon_loss + lambda_phys * phys_loss
+        # Physics-dominant total loss
+        total_loss = RECON_WEIGHT * recon_loss + lambda_phys * phys_loss
         total_loss.backward()
         optimizer.step()
 
@@ -149,9 +155,11 @@ def main():
         log_row = {
             "epoch": epoch,
             "total": float(total_loss.item()),
+            # log the *unscaled* recon + phys for interpretability
             "recon": float(recon_loss.item()),
             "phys": float(phys_loss.item()),
             "lambda_phys": float(lambda_phys),
+            "recon_weight": float(RECON_WEIGHT),
             "GradNorm": grad_norm,
         }
         # Also stash the current mean metrics (detached to CPU)
@@ -165,9 +173,9 @@ def main():
                 f"{name}: {log_row[f'pred_{name}']:.5f}" for name in metric_names
             )
             print(
-                f"Epoch {epoch:3d}/{num_epochs} | "
+                f"Epoch {epoch:3d}/{NUM_EPOCHS} | "
                 f"Total: {log_row['total']:.5f} | "
-                f"Recon: {log_row['recon']:.5f} | "
+                f"Recon(unscaled): {log_row['recon']:.5f} | "
                 f"Phys: {log_row['phys']:.5f} | "
                 f"λ_phys: {lambda_phys:.2f} | "
                 f"{metrics_str} | "
