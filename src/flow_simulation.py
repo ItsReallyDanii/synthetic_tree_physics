@@ -129,7 +129,9 @@ def analyze_dataset_flow(name, path, tag):
 
 def main():
     real_df, real_eff = analyze_dataset_flow(
-        "Real Xylem", "data/real_xylem", "real"
+        "Real Xylem",
+        "data/real_xylem_preprocessed",  # NEW: use grayscale preprocessed images
+        "real",
     )
     synth_df, synth_eff = analyze_dataset_flow(
         "Synthetic Xylem", "data/generated_microtubes", "synthetic"
